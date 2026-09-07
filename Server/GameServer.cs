@@ -71,11 +71,17 @@ public sealed class GameServer : IDisposable
         public bool BotSuperSmashPlanned;
         public float SuperMinionCycleSeconds;
         public bool SuperMinionsActive;
-        // Exactly one helper is assigned to each incoming ball. Minion IDs are monotonic
-        // because survivors persist across later summon waves until they successfully hit.
-        public int SuperMinionInterceptor = -1;
+        // Up to ceil(living minions / 5) helpers may commit to an incoming ball. The first
+        // selected helper owns the authoritative return; the others visibly cover nearby
+        // lanes without creating duplicate ball contacts.
+        public readonly int[] SuperMinionInterceptors = new int[4] { -1, -1, -1, -1 };
+        public int SuperMinionInterceptorCount;
         public int NextSuperMinionId;
         public float SuperMinionRetryCooldown;
+        // Server-only idle movement state. This is intentionally not network schema: clients
+        // already receive each minion's authoritative Position in WorldState.
+        public readonly Dictionary<int, Vector3> SuperMinionWanderTargets = new();
+        public readonly Dictionary<int, float> SuperMinionWanderRetargetSeconds = new();
         // Minions that already returned the ball stay visible until their committed swing
         // animation finishes. They remain present (and keep the boss passive) during this
         // short visual tail, then are removed and emit the replicated sparkle explosion.
@@ -426,6 +432,14 @@ public sealed class GameServer : IDisposable
             AdvancePlayerJump(room, player, dt);
         UpdateAutomaticServe(room, dt);
 
+        // Give persistent Super Impossible helpers a pre-physics interception opportunity.
+        // This is what allows a helper to rescue a still-airborne incoming ball even after it
+        // has already left the painted arena, before normal boundary scoring can end the point.
+        if (room.BotEnabled && IsSuperImpossible(room.BotDifficulty) && room.World.Minions.Count > 0 &&
+            room.World.Phase == MatchPhase.Rally && room.World.Ball.InPlay &&
+            (!room.AutoServeActive || room.AutoServeBallLaunched))
+            UpdateSuperImpossibleMinionsAfterPhysics(room);
+
         MatchPhase phaseAtPhysicsStart = room.World.Phase;
         if (room.World.Phase is MatchPhase.ServeToss or MatchPhase.Rally)
         {
@@ -705,6 +719,12 @@ public sealed class GameServer : IDisposable
 
     private static readonly float[] SuperMinionSideOffsets = { -1.70f, -0.85f, 0.85f, 1.70f };
     private const float SuperMinionMinimumSpacing = 0.72f;
+    // Approximate combined left-to-right arm span of the smaller rendered helper. Idle
+    // helpers evacuate the live ball path and any teleport contact target by at least this.
+    private const float SuperMinionArmSpanMargin = 1.35f;
+    private const float SuperMinionWanderSpeed = 1.15f;
+    private const float SuperMinionWanderRetargetMin = 1.25f;
+    private const float SuperMinionWanderRetargetMax = 3.25f;
     // Persistent helpers never expire, so cap the live population to keep replication,
     // rendering, spacing checks, and interception selection permanently bounded.
     private const int MaximumSuperMinions = 16;
@@ -714,13 +734,15 @@ public sealed class GameServer : IDisposable
         if (!IsSuperImpossible(room.BotDifficulty))
         {
             room.SuperMinionsActive = false;
-            room.SuperMinionInterceptor = -1;
+            ClearSuperMinionInterceptors(room);
             room.SuperMinionsPendingExplosion.Clear();
+            room.SuperMinionWanderTargets.Clear();
+            room.SuperMinionWanderRetargetSeconds.Clear();
             room.World.Minions.Clear();
             return;
         }
 
-        // Minions no longer expire. The summon clock advances only during live rally time;
+        // Minions never expire. The summon clock advances only during live rally time;
         // every five rally seconds another four-minion wave is added into unoccupied slots.
         if (room.World.Phase == MatchPhase.Rally && room.World.Ball.InPlay)
         {
@@ -735,7 +757,7 @@ public sealed class GameServer : IDisposable
         room.SuperMinionsActive = room.World.Minions.Count > 0;
         if (!room.SuperMinionsActive)
         {
-            room.SuperMinionInterceptor = -1;
+            ClearSuperMinionInterceptors(room);
             return;
         }
 
@@ -746,13 +768,16 @@ public sealed class GameServer : IDisposable
         int opponentId = 1 - boss.Id;
         bool incoming = room.World.Ball.LastHitBy == opponentId;
         if (!incoming)
-            room.SuperMinionInterceptor = -1;
+            ClearSuperMinionInterceptors(room);
 
-        // Persistent minions keep their current ground positions between shots. A minion that
-        // has already made successful contact is deliberately kept alive for the remainder of
+        // Make idle helpers feel alive without adding protocol data. They stroll only on the
+        // boss's own half, but can instantly evacuate an unsafe ball corridor or a committed
+        // interceptor's teleport target. Interceptors themselves are handled separately.
+        UpdateSuperMinionWandering(room, boss, dt);
+
+        // A minion that has already made successful contact stays alive for the remainder of
         // the SAME committed swing. Only after the animation reaches its natural endpoint is
-        // that minion removed and its sparkle firework replicated. This is visual timing only:
-        // ball velocity/scoring changed at the original contact instant and are never delayed.
+        // that minion removed and its sparkle firework replicated. Ball physics are unchanged.
         for (int i = room.World.Minions.Count - 1; i >= 0; i--)
         {
             MinionState minion = room.World.Minions[i];
@@ -773,14 +798,13 @@ public sealed class GameServer : IDisposable
             room.World.MinionExplosionSequence++;
             int explodedId = minion.Id;
             room.World.Minions.RemoveAt(i);
-            if (room.SuperMinionInterceptor == explodedId) room.SuperMinionInterceptor = -1;
+            room.SuperMinionWanderTargets.Remove(explodedId);
+            room.SuperMinionWanderRetargetSeconds.Remove(explodedId);
+            RemoveSuperMinionInterceptor(room, explodedId);
             room.World.Message = $"Minion {explodedId + 1} finishes its swing and explodes into sparkles.";
         }
 
         room.SuperMinionsActive = room.World.Minions.Count > 0;
-
-        // Spacing is enforced only when a minion is spawned or teleported. Running an
-        // O(n^2) relaxation pass every 120 Hz tick caused needless long-session CPU load.
     }
 
     private void SpawnSuperMinionWave(MatchRoom room)
@@ -798,15 +822,18 @@ public sealed class GameServer : IDisposable
 
         for (int i = 0; i < spawnCount; i++)
         {
+            int id = room.NextSuperMinionId++;
             Vector3 desired = new(boss.Position.X + SuperMinionSideOffsets[i], 0f, boss.Position.Z);
-            Vector3 safe = FindSafeMinionSpawn(room.World.Minions, desired, boss.Position, room.NextSuperMinionId);
+            Vector3 safe = FindSafeMinionSpawn(room.World.Minions, desired, boss.Position, id);
             room.World.Minions.Add(new MinionState
             {
-                Id = room.NextSuperMinionId++,
+                Id = id,
                 OwnerId = boss.Id,
                 Position = safe,
                 SwingHand = (i & 1) == 0 ? HandedSwing.Right : HandedSwing.Left
             });
+            room.SuperMinionWanderTargets[id] = safe;
+            room.SuperMinionWanderRetargetSeconds[id] = 0f;
         }
 
         EnsureSuperMinionSpacing(room.World.Minions);
@@ -818,8 +845,6 @@ public sealed class GameServer : IDisposable
 
     private static Vector3 FindSafeMinionSpawn(List<MinionState> minions, Vector3 desired, Vector3 bossPosition, int id)
     {
-        // Summons are infrequent (once per ten rally seconds), so a bounded deterministic
-        // candidate search is preferable to letting a new body overlap an existing survivor.
         float minX = -GameConstants.CourtHalfWidth + 0.35f;
         float maxX = GameConstants.CourtHalfWidth - 0.35f;
         float bossSideMinZ = bossPosition.Z >= 0f ? 0.65f : -GameConstants.CourtHalfLength - 1.7f;
@@ -835,20 +860,89 @@ public sealed class GameServer : IDisposable
                 float shift = lateral == 0 ? 0f : ((lateral & 1) == 1 ? 1f : -1f) * ((lateral + 1) / 2) * 0.78f;
                 float x = Math.Clamp(desired.X + shift, minX, maxX);
                 Vector3 candidate = new(x, 0f, z);
-                if (IsMinionPositionClear(minions, candidate, -1)) return candidate;
+                if (IsMinionPositionClear(minions, candidate, -1, SuperMinionMinimumSpacing)) return candidate;
             }
         }
 
-        // Guaranteed non-stacking fallback: expand farther behind the boss until a free
-        // ground location is found. This is only reachable on an unusually crowded court.
         float directionZ = bossPosition.Z >= 0f ? 1f : -1f;
         for (int step = 1; ; step++)
         {
             float x = Math.Clamp(desired.X + ((id & 1) == 0 ? -0.39f : 0.39f), minX, maxX);
             Vector3 candidate = new(x, 0f, desired.Z + directionZ * step * SuperMinionMinimumSpacing);
-            if (IsMinionPositionClear(minions, candidate, -1)) return candidate;
+            if (IsMinionPositionClear(minions, candidate, -1, SuperMinionMinimumSpacing)) return candidate;
         }
     }
+
+    private void UpdateSuperMinionWandering(MatchRoom room, PlayerState boss, float dt)
+    {
+        BallState ball = room.World.Ball;
+        Vector3 ballStart = new(ball.Position.X, 0f, ball.Position.Z);
+        Vector3 horizontalVelocity = new(ball.Velocity.X, 0f, ball.Velocity.Z);
+        float lookAheadSeconds = 0.40f;
+        Vector3 ballEnd = ballStart + horizontalVelocity * lookAheadSeconds;
+
+        for (int i = 0; i < room.World.Minions.Count; i++)
+        {
+            MinionState minion = room.World.Minions[i];
+            if (minion.Swinging || room.SuperMinionsPendingExplosion.Contains(minion.Id) || IsSuperMinionInterceptor(room, minion.Id))
+                continue;
+
+            bool unsafeBallPath = DistancePointToSegmentXZ(minion.Position, ballStart, ballEnd) < SuperMinionArmSpanMargin;
+            if (unsafeBallPath)
+            {
+                minion.Position = FindSafeIdleEvacuation(room.World.Minions, minion.Id, minion.Position, boss, ballStart, ballEnd, ReadOnlySpan<Vector3>.Empty);
+                room.SuperMinionWanderTargets[minion.Id] = minion.Position;
+                room.SuperMinionWanderRetargetSeconds[minion.Id] = NextWanderRetargetSeconds();
+                continue;
+            }
+
+            float remaining = room.SuperMinionWanderRetargetSeconds.TryGetValue(minion.Id, out float timer) ? timer - dt : 0f;
+            Vector3 target;
+            if (remaining <= 0f || !room.SuperMinionWanderTargets.TryGetValue(minion.Id, out target) ||
+                Vector3.DistanceSquared(minion.Position, target) < 0.05f)
+            {
+                target = ChooseWanderTarget(room.World.Minions, minion.Id, boss);
+                room.SuperMinionWanderTargets[minion.Id] = target;
+                remaining = NextWanderRetargetSeconds();
+            }
+            room.SuperMinionWanderRetargetSeconds[minion.Id] = remaining;
+
+            Vector3 delta = target - minion.Position;
+            delta.Y = 0f;
+            float distance = delta.Length();
+            if (distance <= 0.0001f) continue;
+            float step = Math.Min(distance, SuperMinionWanderSpeed * dt);
+            Vector3 candidate = minion.Position + delta / distance * step;
+            candidate.Y = 0f;
+            if (IsMinionPositionClear(room.World.Minions, candidate, minion.Id, SuperMinionMinimumSpacing))
+                minion.Position = candidate;
+            else
+                room.SuperMinionWanderRetargetSeconds[minion.Id] = 0f;
+        }
+    }
+
+    private Vector3 ChooseWanderTarget(List<MinionState> minions, int movingId, PlayerState boss)
+    {
+        float minX = -GameConstants.CourtHalfWidth + 0.45f;
+        float maxX = GameConstants.CourtHalfWidth - 0.45f;
+        float minZ = boss.Id == 0 ? -GameConstants.CourtHalfLength - 0.8f : 0.75f;
+        float maxZ = boss.Id == 0 ? -0.75f : GameConstants.CourtHalfLength + 0.8f;
+        for (int attempt = 0; attempt < 12; attempt++)
+        {
+            Vector3 candidate = new(
+                minX + (float)random.NextDouble() * (maxX - minX),
+                0f,
+                minZ + (float)random.NextDouble() * (maxZ - minZ));
+            if (IsMinionPositionClear(minions, candidate, movingId, SuperMinionMinimumSpacing))
+                return candidate;
+        }
+        MinionState? minion = FindMinionById(minions, movingId);
+        return minion?.Position ?? new Vector3(0f, 0f, (minZ + maxZ) * 0.5f);
+    }
+
+    private float NextWanderRetargetSeconds() =>
+        SuperMinionWanderRetargetMin + (float)random.NextDouble() *
+        (SuperMinionWanderRetargetMax - SuperMinionWanderRetargetMin);
 
     private void UpdateSuperImpossibleMinionsAfterPhysics(MatchRoom room)
     {
@@ -861,59 +955,182 @@ public sealed class GameServer : IDisposable
         int opponentId = 1 - boss.Id;
         if (ball.LastHitBy != opponentId) return;
         if (room.SuperMinionRetryCooldown > 0f) return;
+        if (ball.ServeMustBounce) return;
 
-        bool onBossSide = boss.Id == 0 ? ball.Position.Z <= 0.35f : ball.Position.Z >= -0.35f;
-        if (!onBossSide || ball.ServeMustBounce) return;
-        if (ball.Position.Y < 0.12f || ball.Position.Y > 3.25f) return;
+        // Every incoming rally ball gets a minion response immediately. Do not wait for the
+        // ball to enter the boss half and do not reject high/wide rescue attempts. This is
+        // intentionally evaluated before the authoritative physics step too, so a ball that
+        // is already escaping the arena can still be rescued before boundary scoring fires.
+        // The helper formation itself may float when the ball is outside the arena.
 
-        if (room.SuperMinionInterceptor < 0 || FindMinionById(room.World.Minions, room.SuperMinionInterceptor) is null)
-            room.SuperMinionInterceptor = SelectClosestSuperMinion(room.World.Minions, room.SuperMinionsPendingExplosion, ball.Position);
+        // Exact requested squad scaling: ceil(total living minions / 5). With the existing
+        // hard cap of 16 helpers this produces 1..4 interceptors and can never overflow the
+        // fixed interceptor storage.
+        int desiredCount = Math.Clamp((room.World.Minions.Count + 4) / 5, 1, room.SuperMinionInterceptors.Length);
+        SelectClosestSuperMinions(room, ball.Position, desiredCount);
+        if (room.SuperMinionInterceptorCount == 0) return;
 
-        MinionState? interceptor = FindMinionById(room.World.Minions, room.SuperMinionInterceptor);
-        if (interceptor is null) return;
+        PositionInterceptorsAndEvacuate(room, boss, ball);
 
-        PositionSingleInterceptor(room.World.Minions, interceptor, ball, boss);
-        StartSuperMinionSwing(interceptor, ball);
+        MinionState? primary = FindMinionById(room.World.Minions, room.SuperMinionInterceptors[0]);
+        if (primary is null) return;
 
-        if (!LaunchSuperMinionReturn(room, boss, interceptor, ball))
+        // Only the closest helper owns the one authoritative return so the ball never receives
+        // duplicate launches in one tick. Commit the squad's visible swings only after the
+        // bounded solver has validated and launched that return.
+        if (!LaunchSuperMinionReturn(room, boss, primary, ball))
         {
             room.SuperMinionRetryCooldown = 0.06f;
+            ClearSuperMinionInterceptors(room);
             return;
         }
 
-        // Successful contact is still the ONLY minion death trigger, but death is deferred
-        // until this exact committed swing animation finishes. The ball has already changed
-        // course above; keeping the minion alive here changes visuals only. Pending minions
-        // remain in World.Minions, so Super Impossible correctly stays passive until removal.
-        room.SuperMinionsPendingExplosion.Add(interceptor.Id);
+        for (int i = 0; i < room.SuperMinionInterceptorCount; i++)
+        {
+            MinionState? minion = FindMinionById(room.World.Minions, room.SuperMinionInterceptors[i]);
+            if (minion is not null && !minion.Swinging)
+                StartSuperMinionSwing(minion, ball);
+        }
+
+        room.SuperMinionsPendingExplosion.Add(primary.Id);
         room.SuperMinionRetryCooldown = 0f;
-        room.SuperMinionInterceptor = -1;
+        ClearSuperMinionInterceptors(room);
         room.BotDecisionCooldown = 0.05f;
-        room.World.Message = $"Minion {interceptor.Id + 1} returns the ball and completes its swing.";
+        room.World.Message = $"Minion {primary.Id + 1} returns the ball while the squad covers the rescue.";
     }
 
-    private static int SelectClosestSuperMinion(
-        List<MinionState> minions, HashSet<int> pendingExplosion, Vector3 ballPosition)
+    private static void SelectClosestSuperMinions(MatchRoom room, Vector3 ballPosition, int desiredCount)
     {
-        int bestId = -1;
-        float bestDistanceSquared = float.MaxValue;
+        ClearSuperMinionInterceptors(room);
+        Span<float> bestDistances = stackalloc float[4] { float.MaxValue, float.MaxValue, float.MaxValue, float.MaxValue };
+        Span<int> bestIds = stackalloc int[4] { -1, -1, -1, -1 };
         Vector3 groundBall = new(ballPosition.X, 0f, ballPosition.Z);
-        for (int i = 0; i < minions.Count; i++)
-        {
-            MinionState minion = minions[i];
-            // A helper that has already hit is finishing its swing and cannot be assigned
-            // a second ball before it disappears. It still occupies space until then.
-            if (pendingExplosion.Contains(minion.Id)) continue;
 
+        for (int i = 0; i < room.World.Minions.Count; i++)
+        {
+            MinionState minion = room.World.Minions[i];
+            if (room.SuperMinionsPendingExplosion.Contains(minion.Id) || minion.Swinging) continue;
             Vector3 delta = minion.Position - groundBall;
             float distanceSquared = delta.X * delta.X + delta.Z * delta.Z;
-            if (distanceSquared < bestDistanceSquared)
+
+            for (int slot = 0; slot < desiredCount; slot++)
             {
-                bestDistanceSquared = distanceSquared;
-                bestId = minion.Id;
+                if (distanceSquared >= bestDistances[slot]) continue;
+                for (int shift = desiredCount - 1; shift > slot; shift--)
+                {
+                    bestDistances[shift] = bestDistances[shift - 1];
+                    bestIds[shift] = bestIds[shift - 1];
+                }
+                bestDistances[slot] = distanceSquared;
+                bestIds[slot] = minion.Id;
+                break;
             }
         }
-        return bestId;
+
+        for (int i = 0; i < desiredCount; i++)
+        {
+            if (bestIds[i] < 0) break;
+            room.SuperMinionInterceptors[room.SuperMinionInterceptorCount++] = bestIds[i];
+        }
+    }
+
+    private static void PositionInterceptorsAndEvacuate(MatchRoom room, PlayerState boss, BallState ball)
+    {
+        float zBehindBall = boss.Id == 0 ? ball.Position.Z - 0.34f : ball.Position.Z + 0.34f;
+        int count = room.SuperMinionInterceptorCount;
+        Span<Vector3> targets = stackalloc Vector3[4];
+        float spacing = Math.Max(SuperMinionArmSpanMargin, SuperMinionMinimumSpacing);
+        float center = (count - 1) * 0.5f;
+
+        bool outsideArena = MathF.Abs(ball.Position.X) > GameConstants.CourtHalfWidth + GameConstants.BallRadius ||
+                            MathF.Abs(ball.Position.Z) > GameConstants.CourtHalfLength + GameConstants.BallRadius;
+        // Ground helpers stay grounded for normal court defense. When rescuing an out-of-arena
+        // ball they may float just enough to put the same swing volume around the ball. There
+        // is intentionally no arena or altitude clamp on the rescue position.
+        float rescueY = outsideArena ? MathF.Max(0f, ball.Position.Y - 1.05f) : 0f;
+
+        // Symmetric side-by-side formation centered on the ball: 1=center, 2=left/right,
+        // 3=left/center/right, 4=two per side. Exact arm-span spacing prevents stacking.
+        for (int i = 0; i < count; i++)
+            targets[i] = new Vector3(ball.Position.X + (i - center) * spacing, rescueY, zBehindBall);
+
+        Vector3 ballStart = new(ball.Position.X, 0f, ball.Position.Z);
+        Vector3 ballEnd = ballStart + new Vector3(ball.Velocity.X, 0f, ball.Velocity.Z) * 0.40f;
+
+        // Move non-assigned helpers out of both the live ball corridor and every committed
+        // teleport destination by a full minion arm span before the interceptors arrive.
+        for (int m = 0; m < room.World.Minions.Count; m++)
+        {
+            MinionState minion = room.World.Minions[m];
+            if (IsSuperMinionInterceptor(room, minion.Id) || room.SuperMinionsPendingExplosion.Contains(minion.Id))
+                continue;
+
+            bool unsafe = DistancePointToSegmentXZ(minion.Position, ballStart, ballEnd) < SuperMinionArmSpanMargin;
+            if (!unsafe)
+            {
+                for (int t = 0; t < count; t++)
+                {
+                    if (DistanceXZ(minion.Position, targets[t]) < SuperMinionArmSpanMargin)
+                    {
+                        unsafe = true;
+                        break;
+                    }
+                }
+            }
+            if (!unsafe) continue;
+
+            minion.Position = FindSafeIdleEvacuation(room.World.Minions, minion.Id, minion.Position, boss, ballStart, ballEnd, targets[..count]);
+            room.SuperMinionWanderTargets[minion.Id] = minion.Position;
+            room.SuperMinionWanderRetargetSeconds[minion.Id] = 0f;
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            MinionState? minion = FindMinionById(room.World.Minions, room.SuperMinionInterceptors[i]);
+            if (minion is null) continue;
+            // Interceptors own reserved formation slots. Ignore the selected squad's OLD
+            // positions while validating those slots; otherwise a helper that has not moved
+            // yet can incorrectly displace another helper from its intended side-by-side slot.
+            // Non-selected helpers were evacuated above and still participate in clearance.
+            minion.Position = FindSafeInterceptorTeleport(room, minion.Id, targets[i]);
+        }
+    }
+
+    private static Vector3 FindSafeIdleEvacuation(
+        List<MinionState> minions, int movingId, Vector3 origin, PlayerState boss,
+        Vector3 ballStart, Vector3 ballEnd, ReadOnlySpan<Vector3> reservedTargets)
+    {
+        float minX = -GameConstants.CourtHalfWidth + 0.45f;
+        float maxX = GameConstants.CourtHalfWidth - 0.45f;
+        float minZ = boss.Id == 0 ? -GameConstants.CourtHalfLength - 0.8f : 0.75f;
+        float maxZ = boss.Id == 0 ? -0.75f : GameConstants.CourtHalfLength + 0.8f;
+
+        for (int ring = 1; ring <= 10; ring++)
+        {
+            float radius = SuperMinionArmSpanMargin * ring;
+            for (int step = 0; step < 12; step++)
+            {
+                float angle = MathF.Tau * step / 12f;
+                Vector3 candidate = new(
+                    Math.Clamp(origin.X + MathF.Cos(angle) * radius, minX, maxX),
+                    0f,
+                    Math.Clamp(origin.Z + MathF.Sin(angle) * radius, minZ, maxZ));
+                if (!IsMinionPositionClear(minions, candidate, movingId, SuperMinionMinimumSpacing)) continue;
+                if (DistancePointToSegmentXZ(candidate, ballStart, ballEnd) < SuperMinionArmSpanMargin) continue;
+
+                bool targetClear = true;
+                for (int i = 0; i < reservedTargets.Length; i++)
+                {
+                    if (DistanceXZ(candidate, reservedTargets[i]) < SuperMinionArmSpanMargin)
+                    {
+                        targetClear = false;
+                        break;
+                    }
+                }
+                if (targetClear) return candidate;
+            }
+        }
+        return origin;
     }
 
     private static MinionState? FindMinionById(List<MinionState> minions, int id)
@@ -924,41 +1141,64 @@ public sealed class GameServer : IDisposable
         return null;
     }
 
-    private static void PositionSingleInterceptor(List<MinionState> minions, MinionState interceptor, BallState ball, PlayerState boss)
+    private static Vector3 FindSafeInterceptorTeleport(MatchRoom room, int movingId, Vector3 desired)
     {
-        float zBehindBall = boss.Id == 0 ? ball.Position.Z - 0.34f : ball.Position.Z + 0.34f;
-        Vector3 desired = new(ball.Position.X, 0f, zBehindBall);
-        interceptor.Position = FindSafeMinionTeleport(minions, interceptor.Id, desired);
-    }
+        Vector3 basePosition = desired;
+        if (IsInterceptorSlotClear(room, basePosition, movingId)) return basePosition;
 
-    private static Vector3 FindSafeMinionTeleport(List<MinionState> minions, int movingId, Vector3 desired)
-    {
-        float minX = -GameConstants.CourtHalfWidth + 0.35f;
-        float maxX = GameConstants.CourtHalfWidth - 0.35f;
-        Vector3 clamped = new(Math.Clamp(desired.X, minX, maxX), 0f, desired.Z);
-        if (IsMinionPositionClear(minions, clamped, movingId)) return clamped;
-
-        // Search an expanding eight-way ring around the intended contact point. Only the
-        // selected minion teleports, and this loop runs once per incoming shot, not per tick.
-        for (int ring = 1; ring <= 6; ring++)
+        // Extremely rare fallback if an idle helper could not evacuate. Keep the squad
+        // side-by-side by searching only outward along X in whole arm-span increments.
+        for (int step = 1; step <= 12; step++)
         {
-            float r = SuperMinionMinimumSpacing * ring;
-            for (int step = 0; step < 8; step++)
-            {
-                float angle = MathF.Tau * step / 8f;
-                Vector3 candidate = new(
-                    Math.Clamp(clamped.X + MathF.Cos(angle) * r, minX, maxX),
-                    0f,
-                    clamped.Z + MathF.Sin(angle) * r);
-                if (IsMinionPositionClear(minions, candidate, movingId)) return candidate;
-            }
+            float offset = SuperMinionArmSpanMargin * step;
+            Vector3 left = new(basePosition.X - offset, basePosition.Y, basePosition.Z);
+            if (IsInterceptorSlotClear(room, left, movingId)) return left;
+            Vector3 right = new(basePosition.X + offset, basePosition.Y, basePosition.Z);
+            if (IsInterceptorSlotClear(room, right, movingId)) return right;
         }
-        return clamped;
+        return basePosition;
     }
 
-    private static bool IsMinionPositionClear(List<MinionState> minions, Vector3 candidate, int ignoredId)
+    private static bool IsInterceptorSlotClear(MatchRoom room, Vector3 candidate, int movingId)
     {
         float minimumSquared = SuperMinionMinimumSpacing * SuperMinionMinimumSpacing;
+        for (int i = 0; i < room.World.Minions.Count; i++)
+        {
+            MinionState other = room.World.Minions[i];
+            if (other.Id == movingId || IsSuperMinionInterceptor(room, other.Id)) continue;
+            float dx = other.Position.X - candidate.X;
+            float dz = other.Position.Z - candidate.Z;
+            if (dx * dx + dz * dz < minimumSquared) return false;
+        }
+        return true;
+    }
+
+    private static Vector3 FindSafeMinionTeleport(List<MinionState> minions, int movingId, Vector3 desired, bool noArenaBounds)
+    {
+        Vector3 basePosition = noArenaBounds
+            ? new Vector3(desired.X, 0f, desired.Z)
+            : new Vector3(Math.Clamp(desired.X, -GameConstants.CourtHalfWidth + 0.35f, GameConstants.CourtHalfWidth - 0.35f), 0f, desired.Z);
+        if (IsMinionPositionClear(minions, basePosition, movingId, SuperMinionMinimumSpacing)) return basePosition;
+
+        for (int ring = 1; ring <= 8; ring++)
+        {
+            float r = SuperMinionArmSpanMargin * ring;
+            for (int step = 0; step < 12; step++)
+            {
+                float angle = MathF.Tau * step / 12f;
+                float x = basePosition.X + MathF.Cos(angle) * r;
+                if (!noArenaBounds)
+                    x = Math.Clamp(x, -GameConstants.CourtHalfWidth + 0.35f, GameConstants.CourtHalfWidth - 0.35f);
+                Vector3 candidate = new(x, 0f, basePosition.Z + MathF.Sin(angle) * r);
+                if (IsMinionPositionClear(minions, candidate, movingId, SuperMinionMinimumSpacing)) return candidate;
+            }
+        }
+        return basePosition;
+    }
+
+    private static bool IsMinionPositionClear(List<MinionState> minions, Vector3 candidate, int ignoredId, float minimumDistance)
+    {
+        float minimumSquared = minimumDistance * minimumDistance;
         for (int i = 0; i < minions.Count; i++)
         {
             MinionState other = minions[i];
@@ -972,8 +1212,6 @@ public sealed class GameServer : IDisposable
 
     private static void EnsureSuperMinionSpacing(List<MinionState> minions)
     {
-        // Defensive bounded relaxation: every minion is ground-only, so X/Z separation is
-        // sufficient to prevent visible body stacking after summons or teleports.
         for (int pass = 0; pass < 4; pass++)
         {
             for (int i = 0; i < minions.Count; i++)
@@ -999,10 +1237,29 @@ public sealed class GameServer : IDisposable
         }
     }
 
+    private static float DistanceXZ(Vector3 a, Vector3 b)
+    {
+        float dx = a.X - b.X;
+        float dz = a.Z - b.Z;
+        return MathF.Sqrt(dx * dx + dz * dz);
+    }
+
+    private static float DistancePointToSegmentXZ(Vector3 point, Vector3 start, Vector3 end)
+    {
+        Vector2 p = new(point.X, point.Z);
+        Vector2 a = new(start.X, start.Z);
+        Vector2 b = new(end.X, end.Z);
+        Vector2 ab = b - a;
+        float lengthSquared = ab.LengthSquared();
+        if (lengthSquared <= 0.000001f) return Vector2.Distance(p, a);
+        float t = Math.Clamp(Vector2.Dot(p - a, ab) / lengthSquared, 0f, 1f);
+        return Vector2.Distance(p, a + ab * t);
+    }
+
     private static void StartSuperMinionSwing(MinionState minion, BallState ball)
     {
         minion.SwingHand = ball.Position.X >= minion.Position.X ? HandedSwing.Left : HandedSwing.Right;
-        minion.SwingHeight = Math.Clamp(ball.Position.Y - 0.48f, 0.35f, 2.25f);
+        minion.SwingHeight = Math.Clamp(ball.Position.Y - minion.Position.Y - 0.48f, 0.35f, 2.25f);
         minion.RacquetFaceAngle = -0.42f;
         minion.Swinging = true;
         minion.SwingProgress = SwingAnimation.DurationSeconds * 0.50f;
@@ -1015,7 +1272,7 @@ public sealed class GameServer : IDisposable
             Id = boss.Id,
             Name = "Super Impossible Minion",
             Position = minion.Position,
-            Grounded = true,
+            Grounded = minion.Position.Y <= 0.001f,
             Swinging = true,
             SwingProgress = SwingAnimation.DurationSeconds * 0.50f,
             SwingHand = minion.SwingHand,
@@ -1029,6 +1286,34 @@ public sealed class GameServer : IDisposable
         room.BotSuperSmashPlanned = false; // minions never use the flying smash path
         room.BotImpossibleShotStyle = ShotStyle.Forehand;
         return LaunchBotReturn(room, helper);
+    }
+
+    private static bool IsSuperMinionInterceptor(MatchRoom room, int id)
+    {
+        for (int i = 0; i < room.SuperMinionInterceptorCount; i++)
+            if (room.SuperMinionInterceptors[i] == id) return true;
+        return false;
+    }
+
+    private static void ClearSuperMinionInterceptors(MatchRoom room)
+    {
+        for (int i = 0; i < room.SuperMinionInterceptors.Length; i++)
+            room.SuperMinionInterceptors[i] = -1;
+        room.SuperMinionInterceptorCount = 0;
+    }
+
+    private static void RemoveSuperMinionInterceptor(MatchRoom room, int id)
+    {
+        int write = 0;
+        for (int i = 0; i < room.SuperMinionInterceptorCount; i++)
+        {
+            int current = room.SuperMinionInterceptors[i];
+            if (current == id) continue;
+            room.SuperMinionInterceptors[write++] = current;
+        }
+        for (int i = write; i < room.SuperMinionInterceptors.Length; i++)
+            room.SuperMinionInterceptors[i] = -1;
+        room.SuperMinionInterceptorCount = write;
     }
 
     private void UpdateBot(MatchRoom room, float dt)
