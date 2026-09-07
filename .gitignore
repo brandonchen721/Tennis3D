@@ -24,3 +24,5 @@ Thumbs.db
 # JetBrains Rider
 .idea/
 *.sln.iml
+
+Server/server-health.json
